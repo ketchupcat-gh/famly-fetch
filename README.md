@@ -94,6 +94,28 @@ famly-fetch
 Enter your email and password when prompted, or provide an access token for authentication. Run `famly-fetch --help` to
 get full help page.
 
+### Scheduled runs: cache the access token
+
+Famly emails the account holder a "we noticed you logged in using a device we
+haven't seen you using recently" notice on every password authentication. Each
+run authenticates from scratch, so anything on a schedule produces one of those
+emails per run.
+
+Pass `--token-cache FILE` (or set `FAMLY_TOKEN_CACHE`) to store the access token
+and reuse it:
+
+```bash
+famly-fetch -f --token-cache ~/.cache/famly-fetch/token
+```
+
+The cached token is checked before use and a login happens only when the server
+stops accepting it, so the notices drop to roughly one per token expiry. The
+file is written mode `0600` because the token authenticates the whole account;
+keep it somewhere private and out of version control.
+
+`--access-token` still takes precedence and is never written to the cache, on
+the assumption that a caller supplying one is managing it themselves.
+
 Downloaded images will be stored in the `pictures` directory of the
 the folder where you run this program from.
 
@@ -181,6 +203,12 @@ Options:
                                   FAMLY_PASSWORD env var
   --access-token TOKEN            Your famly.co access token, can be set via
                                   FAMLY_ACCESS_TOKEN env var
+  --token-cache FILE              Path to cache the access token in. Famly
+                                  emails you a new-device notice on every
+                                  password login, so a scheduled run sends one
+                                  per run; caching reuses the token until the
+                                  server rejects it. Can be set via
+                                  FAMLY_TOKEN_CACHE env var
   --famly-base-url URL            Your famly.co instance baseurl (default:
                                   https://app.famly.co), can be set via
                                   FAMLY_BASE_URL env var

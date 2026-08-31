@@ -22,10 +22,80 @@ import click
 import piexif
 import piexif.helper
 
-from famly_fetch.api_client import ApiClient
+from famly_fetch.api_client import ApiClient, urlopen_with_backoff
 from famly_fetch.file import File
 from famly_fetch.image import BaseImage, Image, SecretImage
 from famly_fetch.video import Video
+
+
+def read_token_cache(path: Path) -> str | None:
+    """Return the cached access token, or None if there isn't a usable one."""
+    try:
+        return path.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def write_token_cache(path: Path, token: str) -> None:
+    """Write the access token, readable only by its owner.
+
+    Created with 0o600 in the open() call rather than chmod'ed afterwards, so
+    the token is never briefly on disk under the default umask: it is a bearer
+    credential for the whole Famly account.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token)
+
+
+def build_api_client(
+    base_url: str,
+    user_agent: str | None,
+    email: str,
+    password: str,
+    access_token: str | None,
+    token_cache: Path | None,
+) -> ApiClient:
+    """Return an authenticated ApiClient, reusing a cached token if there is one.
+
+    Famly issues one long-lived opaque access token and mails the account
+    holder a "logged in using a device we haven't seen" notice on every
+    password authentication. A scheduled run therefore generates one of those
+    per run, which is noise at daily frequency and unusable at quarter-hourly.
+
+    With token_cache set, the token is stored and reused until the server
+    stops accepting it, so a login happens only when the cached token expires
+    or is revoked. An explicitly supplied access_token is used as-is and is
+    never cached, since the caller is managing it.
+    """
+    if access_token:
+        return ApiClient(
+            base_url=base_url, user_agent=user_agent, access_token=access_token
+        )
+
+    if token_cache is not None:
+        cached = read_token_cache(token_cache)
+        if cached:
+            client = ApiClient(
+                base_url=base_url, user_agent=user_agent, access_token=cached
+            )
+            # An expired token comes back as a 401, which make_api_request
+            # reports by returning None rather than raising.
+            if client.me_me_me():
+                return client
+            click.secho("Cached access token rejected, logging in.", fg="yellow")
+
+    if not email or not password:
+        raise click.ClickException(
+            "No usable access token and no email/password to log in with."
+        )
+
+    client = ApiClient(base_url=base_url, user_agent=user_agent)
+    client.login(email, password)
+    if token_cache is not None:
+        write_token_cache(token_cache, client.access_token)
+    return client
 
 
 class FamlyDownloader:
@@ -45,6 +115,7 @@ class FamlyDownloader:
         filename_pattern: str = "%FP-%Y-%m-%d_%H-%M-%S-%ID",
         include_files: bool = False,
         include_videos: bool = False,
+        token_cache: Path | None = None,
     ):
         self._pictures_folder: Path = pictures_folder
         self._pictures_folder.mkdir(parents=True, exist_ok=True)
@@ -59,11 +130,14 @@ class FamlyDownloader:
         self.include_videos = include_videos
         self.downloaded_images = self.load_state()
 
-        self._apiClient = ApiClient(
-            base_url=famly_base_url, user_agent=user_agent, access_token=access_token
+        self._apiClient = build_api_client(
+            base_url=famly_base_url,
+            user_agent=user_agent,
+            email=email,
+            password=password,
+            access_token=access_token,
+            token_cache=token_cache,
         )
-        if not access_token:
-            self._apiClient.login(email, password)
 
     def load_state(self):
         if self.state_file.exists():
@@ -527,7 +601,10 @@ class FamlyDownloader:
         """Stream a URL to disk. Used for non-image attachments where EXIF
         injection doesn't apply."""
         req = urllib.request.Request(url=url)
-        with urllib.request.urlopen(req) as r, open(file_path, "wb") as f:
+        with (
+            urlopen_with_backoff(req, attempts=5, base_delay=2.0, max_delay=60.0) as r,
+            open(file_path, "wb") as f,
+        ):
             if r.status != 200:
                 raise Exception(f"Broken! {r.read().decode('utf-8')}")
             shutil.copyfileobj(r, f)
@@ -563,7 +640,10 @@ class FamlyDownloader:
         else:
             timezone_offset = None
 
-        with urllib.request.urlopen(req) as r, open(file_path, "wb") as f:
+        with (
+            urlopen_with_backoff(req, attempts=5, base_delay=2.0, max_delay=60.0) as r,
+            open(file_path, "wb") as f,
+        ):
             if r.status != 200:
                 raise Exception(f"Broken! {r.read().decode('utf-8')}")
             shutil.copyfileobj(r, f)

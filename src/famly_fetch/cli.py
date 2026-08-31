@@ -3,7 +3,7 @@ from pathlib import Path
 
 import click
 
-from famly_fetch.downloader import FamlyDownloader
+from famly_fetch.downloader import FamlyDownloader, read_token_cache
 
 
 def get_version():
@@ -35,6 +35,19 @@ def get_version():
     help="Your famly.co access token, can be set via FAMLY_ACCESS_TOKEN env var",
     metavar="TOKEN",
     type=str,
+)
+@click.option(
+    "--token-cache",
+    envvar="FAMLY_TOKEN_CACHE",
+    help=(
+        "Path to cache the access token in. Famly emails you a new-device "
+        "notice on every password login, so a scheduled run sends one per run; "
+        "caching reuses the token until the server rejects it. Can be set via "
+        "FAMLY_TOKEN_CACHE env var"
+    ),
+    metavar="FILE",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
 )
 @click.option(
     "--famly-base-url",
@@ -153,6 +166,7 @@ def main(
     email: str,
     password: str,
     access_token: str,
+    token_cache: Path,
     famly_base_url: str,
     no_tagged: bool,
     journey: bool,
@@ -176,8 +190,12 @@ def main(
     if state_file is None:
         state_file = pictures_folder / "state.json"
 
-    # Validate authentication parameters
-    if not access_token and (not email or not password):
+    # Validate authentication parameters. A populated token cache counts as
+    # credentials for now: prompting would be wrong when the cached token is
+    # about to be accepted. If it turns out to be stale, build_api_client says
+    # so rather than logging in with nothing.
+    have_cached_token = token_cache is not None and read_token_cache(token_cache)
+    if not access_token and not have_cached_token and (not email or not password):
         if not email:
             email = click.prompt("Enter your famly.co email address", type=str)
         if not password:
@@ -202,6 +220,7 @@ def main(
             state_file=state_file,
             user_agent=user_agent,
             access_token=access_token,
+            token_cache=token_cache,
             latitude=latitude,
             longitude=longitude,
             filename_pattern=filename_pattern,
