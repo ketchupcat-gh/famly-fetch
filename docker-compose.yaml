@@ -9,6 +9,7 @@ services:
       - FAMLY_EMAIL=${FAMLY_EMAIL} # default to get value from host environment
       - FAMLY_PASSWORD=${FAMLY_PASSWORD} # default to get value from host environment
       - FAMLY_PICTURES_FOLDER=/app/pictures
+      - FAMLY_FILENAME_PATTERN=${FAMLY_FILENAME_PATTERN:-%FP-%Y-%m-%d_%H-%M-%S-%ID}
     volumes:
       - ./pictures:/app/pictures
     entrypoint: ["famly-fetch", "-e"]

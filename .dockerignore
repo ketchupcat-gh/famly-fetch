@@ -1,0 +1,9 @@
+pictures/
+venv/
+.venv/
+.git/
+.github/
+.vscode/
+*.egg-info/
+__pycache__/
+.DS_Store
