@@ -74,7 +74,9 @@ class FetchImageExifTest(unittest.TestCase):
             text=text,
         )
         with mock.patch(
-            "famly_fetch.downloader.urllib.request.urlopen",
+            # fetch_image downloads via api_client.download_to_file_with_backoff,
+            # so that is where urlopen is now reached from.
+            "famly_fetch.api_client.urllib.request.urlopen",
             return_value=FakeResponse(TINY_JPEG),
         ):
             self.downloader.fetch_image(img, self.file_path)

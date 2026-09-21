@@ -11,7 +11,6 @@ Auth has two versions:
 
 import json
 import os
-import shutil
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -22,7 +21,7 @@ import click
 import piexif
 import piexif.helper
 
-from famly_fetch.api_client import ApiClient, urlopen_with_backoff
+from famly_fetch.api_client import ApiClient, download_to_file_with_backoff
 from famly_fetch.file import File
 from famly_fetch.image import BaseImage, Image, SecretImage
 from famly_fetch.video import Video
@@ -601,13 +600,9 @@ class FamlyDownloader:
         """Stream a URL to disk. Used for non-image attachments where EXIF
         injection doesn't apply."""
         req = urllib.request.Request(url=url)
-        with (
-            urlopen_with_backoff(req, attempts=5, base_delay=2.0, max_delay=60.0) as r,
-            open(file_path, "wb") as f,
-        ):
-            if r.status != 200:
-                raise Exception(f"Broken! {r.read().decode('utf-8')}")
-            shutil.copyfileobj(r, f)
+        download_to_file_with_backoff(
+            req, file_path, attempts=5, base_delay=2.0, max_delay=60.0
+        )
 
     def download_file_path(self, img: BaseImage, filename_prefix: str) -> Path:
         """Generate the file path for the downloaded image."""
@@ -640,13 +635,9 @@ class FamlyDownloader:
         else:
             timezone_offset = None
 
-        with (
-            urlopen_with_backoff(req, attempts=5, base_delay=2.0, max_delay=60.0) as r,
-            open(file_path, "wb") as f,
-        ):
-            if r.status != 200:
-                raise Exception(f"Broken! {r.read().decode('utf-8')}")
-            shutil.copyfileobj(r, f)
+        download_to_file_with_backoff(
+            req, file_path, attempts=5, base_delay=2.0, max_delay=60.0
+        )
 
         try:
             piexif.load(str(file_path.resolve()))

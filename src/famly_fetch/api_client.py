@@ -1,43 +1,169 @@
 import hashlib
+import http.client
 import json
+import shutil
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 from importlib_resources import files
+
+#: Network failures that surface while the response body is being read, after
+#: urlopen() has already returned successfully. Retrying the urlopen() call
+#: alone never sees these, so any retry that is meant to cover a transfer has
+#: to catch them around the read as well. IncompleteRead in particular is what
+#: a CDN produces when it announces a Content-Length and then delivers fewer
+#: bytes.
+TRANSIENT_READ_ERRORS = (
+    http.client.IncompleteRead,
+    ConnectionResetError,
+    TimeoutError,
+)
+
+
+def _backoff_delay(retry_after, attempt, base_delay, max_delay):
+    """
+    Seconds to wait before the next attempt.
+
+    A usable Retry-After from the server wins, clamped to [0, max_delay].
+    Otherwise back off exponentially: base_delay * 2^attempt, capped.
+    """
+    try:
+        return max(0.0, min(float(retry_after), max_delay))
+    except (TypeError, ValueError):
+        return min(base_delay * 2**attempt, max_delay)
+
+
+def _discard_partial(file_path):
+    """
+    Remove a half-written file so the next attempt starts clean.
+
+    A failed transfer leaves whatever bytes did arrive on disk. Left in place
+    those look like a real download to anything that checks for the file, so
+    they are cleared before retrying and before giving up.
+    """
+    try:
+        Path(file_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _retrying(
+    operation,
+    cleanup=None,
+    attempts=5,
+    base_delay=2.0,
+    max_delay=60.0,
+    what="Request",
+):
+    """
+    Run `operation`, retrying transient network failures with backoff.
+
+    Retries HTTP 429, HTTP 5xx, network-level URLError and TRANSIENT_READ_ERRORS,
+    sleeping with exponential backoff (base_delay * 2^attempt, capped at
+    max_delay) between tries. A Retry-After header, when the server sends one,
+    overrides the computed delay. Any other HTTP error, anything that is not a
+    network failure, and the final failed attempt raise as usual.
+
+    `cleanup` runs after every failed attempt, retryable or not, so a caller
+    that leaves a side effect behind (a half-written file) can reset it before
+    the next try and before the error escapes.
+    """
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except urllib.error.HTTPError as e:
+            if cleanup:
+                cleanup()
+            if e.code != 429 and e.code < 500:
+                raise
+            error = e
+            retry_after = e.headers.get("Retry-After")
+        except (urllib.error.URLError, *TRANSIENT_READ_ERRORS) as e:
+            if cleanup:
+                cleanup()
+            error = e
+            retry_after = None
+        except BaseException:
+            # Not retryable (a non-200 body, a bug, Ctrl-C). Still reset any
+            # partial side effect before letting it propagate.
+            if cleanup:
+                cleanup()
+            raise
+        if attempt == attempts - 1:
+            raise error
+        delay = _backoff_delay(retry_after, attempt, base_delay, max_delay)
+        print(f"{what} failed ({error}), retrying in {delay:.0f}s...")
+        time.sleep(delay)
 
 
 def urlopen_with_backoff(req, attempts=5, base_delay=2.0, max_delay=60.0):
     """
     urllib.request.urlopen with retries for throttling and transient failures.
 
-    Retries on HTTP 429, HTTP 5xx, and network-level URLError, sleeping with
-    exponential backoff (base_delay * 2^attempt, capped at max_delay) between
-    tries. A Retry-After header, when the server sends one, overrides the
-    computed delay. Any other HTTP error, and the final failed attempt,
-    raises as usual.
+    Note this covers only establishing the response. Reading the body can fail
+    separately, and the caller does that after this function has returned, so
+    those failures are outside the retry -- use read_body_with_backoff or
+    download_to_file_with_backoff when the whole exchange needs covering.
     """
-    for attempt in range(attempts):
-        try:
-            return urllib.request.urlopen(req)
-        except urllib.error.HTTPError as e:
-            if e.code != 429 and e.code < 500:
-                raise
-            error = e
-            retry_after = e.headers.get("Retry-After")
-        except urllib.error.URLError as e:
-            error = e
-            retry_after = None
-        if attempt == attempts - 1:
-            raise error
-        try:
-            delay = max(0.0, min(float(retry_after), max_delay))
-        except (TypeError, ValueError):
-            delay = min(base_delay * 2**attempt, max_delay)
-        print(f"Request failed ({error}), retrying in {delay:.0f}s...")
-        time.sleep(delay)
+    return _retrying(
+        lambda: urllib.request.urlopen(req),
+        attempts=attempts,
+        base_delay=base_delay,
+        max_delay=max_delay,
+    )
+
+
+def read_body_with_backoff(req, attempts=5, base_delay=2.0, max_delay=60.0):
+    """
+    Fetch a URL and return (status, body decoded as utf-8).
+
+    The body read sits inside the retry, so a response that is truncated or
+    reset partway through is fetched again rather than raising.
+    """
+
+    def _once():
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.read().decode("utf-8")
+
+    return _retrying(
+        _once, attempts=attempts, base_delay=base_delay, max_delay=max_delay
+    )
+
+
+def download_to_file_with_backoff(
+    req, file_path, attempts=5, base_delay=2.0, max_delay=60.0
+):
+    """
+    Stream a URL to disk, retrying the whole transfer on transient failures.
+
+    The body read sits inside the retry, so a transfer that is reset or
+    truncated partway through is retried instead of raising. Each failed
+    attempt's partial file is removed first, so a retry never appends to a stub
+    and a final failure does not leave one behind.
+
+    A non-200 response, any other HTTP error, and the final failed attempt
+    raise as usual.
+    """
+
+    def _once():
+        with urllib.request.urlopen(req) as r:
+            if r.status != 200:
+                raise Exception(f"Broken! {r.read().decode('utf-8')}")
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(r, f)
+
+    _retrying(
+        _once,
+        cleanup=lambda: _discard_partial(file_path),
+        attempts=attempts,
+        base_delay=base_delay,
+        max_delay=max_delay,
+        what="Download",
+    )
 
 
 def get_device_id() -> str:
@@ -188,17 +314,16 @@ class ApiClient:
 
         req = urllib.request.Request(url=url, headers=headers, method=method, data=b)
         try:
-            with urlopen_with_backoff(
+            status, body = read_body_with_backoff(
                 req, attempts=5, base_delay=2.0, max_delay=60.0
-            ) as f:
-                body = f.read().decode("utf-8")
-                if f.status != 200:
-                    raise Exception(f"Broken! {body}")
+            )
+            if status != 200:
+                raise Exception(f"Broken! {body}")
 
-                try:
-                    return json.loads(body)
-                except Exception as _e:
-                    return body
+            try:
+                return json.loads(body)
+            except Exception as _e:
+                return body
         except urllib.error.HTTPError as e:
             # The server couldn't fulfill the request
             print("Error code: ", e.code)
